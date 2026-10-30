@@ -16,6 +16,7 @@ codex                                    # → /status 로 모델·권한 확인
 ```
 
 이 문서는 다른 터미널 탭에서 `less /tmp/starter/README.md` 로 열어 둔다.
+단계별 모범 풀이 예시는 `less /tmp/starter/WORKFLOW.md`.
 
 | 파일 | 언제 | 어떻게 |
 |---|---|---|
@@ -209,4 +210,5 @@ AGENTS.md와 HANDOFF.md 읽고 '다음 세션의 첫 행동'부터 이어가.
 | `.agents/skills/handoff` | HANDOFF.md 갱신 후 커밋 |
 | `.agents/skills/ai-decision-log` | AI 제안의 수용·수정·거절 기록 |
 | `.agents/skills/verify-before-submit` | 제출 직전 점검 |
+| `WORKFLOW.md` | 연습 과제 하나를 처음부터 제출까지 푸는 모범 흐름 (대화 예시, 지시문, 체크리스트) |
 | `bootstrap.sh` | 위 파일을 작업 폴더에 복사, git 초기화·커밋 (기존 파일은 덮어쓰지 않음) |
