@@ -10,7 +10,8 @@ copy() { if [ -e "$DEST/$2" ]; then echo "건너뜀(이미 있음): $2"; else mk
 copy templates/AGENTS.md AGENTS.md
 copy templates/HANDOFF.md HANDOFF.md
 copy templates/DECISIONS.md DECISIONS.md
-for s in handoff ai-decision-log verify-before-submit; do copy ".agents/skills/$s/SKILL.md" ".agents/skills/$s/SKILL.md"; done
+copy templates/VERIFY.md VERIFY.md
+for s in handoff ai-decision-log verify-manual verify-before-submit; do copy ".agents/skills/$s/SKILL.md" ".agents/skills/$s/SKILL.md"; done
 if [ ! -d "$DEST/.git" ]; then git init -q; fi
 git config user.name >/dev/null || git config user.name "candidate"
 git config user.email >/dev/null || git config user.email "candidate@local"
