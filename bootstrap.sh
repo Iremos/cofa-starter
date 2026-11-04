@@ -11,6 +11,8 @@ copy templates/AGENTS.md AGENTS.md
 copy templates/HANDOFF.md HANDOFF.md
 copy templates/DECISIONS.md DECISIONS.md
 copy templates/VERIFY.md VERIFY.md
+copy templates/docs/DESIGN.md docs/DESIGN.md
+copy templates/docs/ARCHITECTURE.md docs/ARCHITECTURE.md
 for s in handoff ai-decision-log verify-manual verify-before-submit; do copy ".agents/skills/$s/SKILL.md" ".agents/skills/$s/SKILL.md"; done
 if [ ! -d "$DEST/.git" ]; then git init -q; fi
 git config user.name >/dev/null || git config user.name "candidate"
