@@ -13,9 +13,12 @@ Codex CLI로 업무형 과제를 풀 때 쓰는 개인 시작 세팅과 행동 �
 
 ```bash
 git clone https://github.com/<계정>/cofa-starter /tmp/starter
-bash /tmp/starter/bootstrap.sh          # context7까지: WITH_CONTEXT7=1 bash /tmp/starter/bootstrap.sh
-codex                                    # → /status 로 모델·권한 확인
+export NEXT_TELEMETRY_DISABLED=1                          # 통계 전송 끄기 (새 터미널마다)
+WITH_CONTEXT7=1 WITH_NEXT_MCP=1 bash /tmp/starter/bootstrap.sh   # MCP 없이: bash /tmp/starter/bootstrap.sh
+codex                                                     # → /status 모델·권한, /mcp 서버 확인
 ```
+
+MCP·스킬 세부는 10장 "도구 세팅".
 
 다른 터미널 탭에서 `less /tmp/starter/README.md` 로 이 문서를 열어 둔다.
 단계별 풀이 예시는 `less /tmp/starter/WORKFLOW.md`.
@@ -324,6 +327,8 @@ AGENTS.md에 "누적하라"는 규칙이 있어도 코드에 집중하면 빠뜨
 - 보여 주기용 단계 추가
 - 키, 개인정보, 사외비를 코드·로그·화면·API 응답에 넣기
 - Codex 버전 업데이트
+- 외부 문서 검색(Context7 등)에 과제 문장·데이터·코드 넣기
+- 통계 전송을 켠 채로 도구 쓰기
 
 ---
 
@@ -333,6 +338,7 @@ AGENTS.md에 "누적하라"는 규칙이 있어도 코드에 집중하면 빠뜨
 - [ ] 웹: 서버 `0.0.0.0` 바인딩, 서버는 **내 터미널 탭**에서 실행, Browser 도구로 직접 클릭
 - [ ] 보안: 민감 정보는 화면에서 숨기는 게 아니라 **서버에서 제거**, 남의 데이터 조회 불가
 - [ ] 외부 CDN 쓰지 않기
+- [ ] `NEXT_TELEMETRY_DISABLED=1`, 브라우저 MCP 통계 옵션 확인 (`codex mcp list`)
 - [ ] 책임 분리가 폴더 구조로 보이는가
 - [ ] (웹) 라우트 파일에 로직 없음, 클라이언트가 `server/`를 import하지 않음
 - [ ] (웹) 관리자 API는 핸들러 안에서 권한 재확인, 사용자 응답은 화이트리스트 DTO
@@ -360,6 +366,34 @@ AGENTS.md에 "누적하라"는 규칙이 있어도 코드에 집중하면 빠뜨
 | 업데이트 안내 | 무시 |
 
 명령 목록은 `/`를 쳐서 확인한다.
+
+### 도구 세팅 (MCP·스킬)
+
+**원칙**: 2~3개만. MCP마다 시작 시간과 토큰이 늘어난다. 추가한 뒤에는 Codex를 재시작하고 `/mcp`로 확인한다.
+
+| 우선 | 도구 | 용도 | 추가 방법 | 외부 전송 주의 |
+|---|---|---|---|---|
+| 1 | Context7 MCP | 라이브러리 공식 문서 조회 (외부 브라우저 금지 환경) | `WITH_CONTEXT7=1` | **검색어가 서버로 전송됨** → 라이브러리 이름·주제만 |
+| 1 | Next.js DevTools MCP | 실행 중인 dev 서버의 런타임 에러·라우트·로그를 Codex가 직접 확인 (Next.js 16+, Node 20.19+) | `WITH_NEXT_MCP=1` | 통계 전송 → `NEXT_TELEMETRY_DISABLED=1` (스크립트가 설정) |
+| 2 | Playwright MCP | 클릭·입력 흐름 회귀 확인 | `WITH_BROWSER_MCP=playwright` | 브라우저 실행 파일 필요 |
+| 2 | Chrome DevTools MCP | 콘솔 에러, 네트워크, 접근성 점검 | `WITH_BROWSER_MCP=chrome` | `--no-usage-statistics --no-performance-crux` (스크립트가 설정) |
+| 2 | `web-design-guidelines` 스킬 (Vercel) | 검토 세션에서 화면 코드의 접근성·UX 점검 | `npx skills add vercel-labs/agent-skills --skill web-design-guidelines -a codex` | 없음 |
+| 2 | `security-best-practices` 스킬 (OpenAI) | 마무리 보안 점검 | Codex 안에서 `$skill-installer security-best-practices` | 없음 |
+
+**언제 추가하나**
+- 시작 시: Context7, Next.js DevTools (Next.js 프로젝트를 만들고 dev 서버를 내 터미널 탭에서 띄운 뒤부터 쓸모 있음)
+- 화면 단계: 필요하면 브라우저 MCP 하나, `web-design-guidelines`
+- 마무리: `security-best-practices`
+- 나중에 추가할 때도 같은 방식: `WITH_BROWSER_MCP=playwright bash /tmp/starter/bootstrap.sh` (복사는 건너뛰고 MCP만 추가됨)
+
+**통계 전송 끄기**
+- 터미널: `export NEXT_TELEMETRY_DISABLED=1` (Next.js 명령을 실행하는 탭마다)
+- Next.js 설치 후 한 번: `npx next telemetry disable` (설정에 저장되어 유지)
+- `codex mcp add`의 `--env` 옵션이 안 먹히면 `~/.codex/config.toml`의 해당 서버에 `env = { NEXT_TELEMETRY_DISABLED = "1" }`
+
+**AI 브라우저 확인은 "실행자: AI"**: 브라우저 MCP로 확인한 결과는 VERIFY.md에 AI 검증으로 적는다. "AI 말만 믿지 않았다"의 근거는 내가 직접 클릭·실행한 기록이다.
+
+**쓰지 않는 것**: 배포 스킬·MCP (외부 전송 금지), GitHub MCP (Push 불가), UI 라이브러리 MCP (DESIGN.md 기준), SQLite MCP (내 터미널의 `sqlite3`나 짧은 스크립트로 충분, 쓰기 위험), 큰 워크플로 스킬 묶음 (토큰·주도권)
 
 ---
 
@@ -404,6 +438,8 @@ AGENTS.md에 "누적하라"는 규칙이 있어도 코드에 집중하면 빠뜨
 | 시간이 부족 | 기능 추가 중단 → 내 검증과 DECISIONS.md 우선 |
 | 패키지 설치 실패 (Next.js, better-sqlite3) | 설치는 한 번만 재시도, 안 되면 Node 내장(`node:sqlite`, 내장 http)로 축소 |
 | 서체 다운로드 실패 | 바로 시스템 서체로 진행 |
+| MCP 추가 실패 / `/mcp`에 안 보임 | Codex 재시작 후 한 번만 재확인, 안 되면 그 도구 없이 진행 |
+| 브라우저 MCP가 브라우저를 못 띄움 | 바로 포기, 플랫폼 Browser 미리보기로 직접 확인 |
 | 플랫폼 오류 반복 | 상단 "문제 신고" (시각, 직전 동작, 오류 문구) |
 
 ---
@@ -423,4 +459,4 @@ AGENTS.md에 "누적하라"는 규칙이 있어도 코드에 집중하면 빠뜨
 | `.agents/skills/ai-decision-log` | AI 제안의 수용·수정·거절 기록 |
 | `.agents/skills/verify-before-submit` | 제출 직전 점검 |
 | `WORKFLOW.md` | 연습 과제 하나를 처음부터 제출까지 푸는 흐름 (대화 예시, 지시문, 검증, 체크리스트) |
-| `bootstrap.sh` | 템플릿과 스킬을 작업 폴더에 복사, git 초기화·커밋 (기존 파일은 덮어쓰지 않음) |
+| `bootstrap.sh` | 템플릿과 스킬을 작업 폴더에 복사, git 초기화·커밋 (기존 파일은 덮어쓰지 않음). 선택 옵션 `WITH_CONTEXT7`, `WITH_NEXT_MCP`, `WITH_BROWSER_MCP=playwright\|chrome`으로 MCP 추가 |
