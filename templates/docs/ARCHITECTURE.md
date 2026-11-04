@@ -224,6 +224,8 @@ Node는 한 프로세스라도 `await` 사이에 다른 요청이 끼어든다. 
 | A, B가 동시에 재계산 버튼 | 무거운 계산 두 번, 결과 섞임 | **작업 단일 실행** (6-3) |
 | A가 재계산하는 동안 B가 새 데이터 업로드 | 옛 입력으로 만든 초안이 게시됨 | **초안의 입력 버전 기록 + 게시 시 재확인** (6-4) |
 | A, B가 동시에 게시 | 버전 번호 충돌, 스냅샷 꼬임 | **게시 트랜잭션** (6-4) |
+| A, B가 **같은 초안**을 동시에 게시 | 같은 내용이 두 버전으로 게시됨 | **트랜잭션 안에서 초안 상태 확인** (6-4) |
+| 게시 커밋 후 latest 파일 쓰기 순서가 엇갈림 | 옛 버전이 최신을 덮어씀 | **latest = DB 최대 버전으로 재동기화** (6-4) |
 
 ### 6-2. 낙관적 잠금 (설정·데이터 수정)
 
@@ -272,33 +274,115 @@ GET /api/admin/jobs?id=  → 상태 폴링 (2초 간격)
 
 ### 6-4. 게시 트랜잭션
 
+**원칙: DB가 진실의 원천, 스냅샷 파일은 DB에서 다시 만들 수 있는 사본.**
+파일 시스템은 DB 트랜잭션에 포함되지 않는다. 그래서 "무엇이 게시됐나"는 항상 `publications` 테이블이 정하고, 파일은 거기에 맞춘다.
+
 ```ts
-// server/publish/publish.ts (개념 예시)
-const publish = db.transaction((draftId, operator) => {
+// server/publish/publish.ts (better-sqlite3)
+// 원자성: db.transaction()이 BEGIN → COMMIT, 함수 안에서 예외가 나면 ROLLBACK
+//        → 안의 쓰기(게시 행, 초안 상태, 감사 로그)는 전부 반영되거나 전부 취소된다.
+// 격리:   .immediate()가 BEGIN IMMEDIATE로 시작해 쓰기 잠금을 먼저 잡는다
+//        → 동시 게시는 한 번에 하나씩 처리되고, 뒤 요청은 busy_timeout 동안 기다린다.
+const publishTx = db.transaction((draftId: number, operator: string) => {
   const d = getDraft(draftId);
-  const cur = currentVersions();                     // 현재 dataset, settings 버전
-  if (d.based_on_dataset_version !== cur.dataset || d.based_on_settings_version !== cur.settings) {
-    markDraftStale(draftId);
-    throw new Conflict("초안 이후 입력이 바뀌었습니다. 다시 계산하세요.");
-  }
-  const v = insertPublication(draftId, operator);    // AUTOINCREMENT 버전
+  if (!d || d.status !== "ready") throw new Conflict("NOT_READY");     // 같은 초안 중복 게시 차단
+  const cur = currentVersions();                                       // 현재 dataset, settings 버전
+  if (d.based_on_dataset_version !== cur.dataset || d.based_on_settings_version !== cur.settings)
+    throw new Conflict("STALE");                                       // 초안 이후 입력이 바뀜
+  const v = insertPublication(draftId, operator);                      // 게시 버전 번호
+  setDraftStatus(draftId, "published");
+  writeSnapshotAtomic(`v${v}.json`, buildSnapshot(d, v));              // 잠금 안에서 버전 파일 쓰기 (동기)
   audit("publish", operator, { version: v, draftId });
   return v;
 });
-const version = publish.immediate(draftId, operator); // BEGIN IMMEDIATE: 쓰기 잠금을 먼저 잡음
-writeSnapshotAtomic(version, buildSnapshot(version)); // 7-2 (트랜잭션 밖에서 파일 쓰기)
+
+export function publish(draftId: number, operator: string) {
+  try {
+    const v = publishTx.immediate(draftId, operator);   // 여기까지 오면 커밋 완료
+    syncLatestPointer();                                 // latest = DB의 최대 게시 버전
+    return { status: 200, version: v };
+  } catch (e) {
+    // 트랜잭션 안의 쓰기는 예외와 함께 롤백되므로, "오래됨" 표시는 트랜잭션 밖에서 남긴다
+    if (e instanceof Conflict && e.code === "STALE") markDraftStale(draftId);
+    if (e instanceof Conflict) return { status: 409, reason: e.code };
+    throw e;
+  }
+}
+
+// 커밋 후, 서버 시작 시, latest 읽기 실패 시 호출
+export function syncLatestPointer() {
+  const max = maxPublishedVersion();                    // SELECT MAX(version) FROM publications
+  if (max && readLatestVersion() !== max) writeSnapshotAtomic("latest.json", readSnapshot(`v${max}.json`));
+}
 ```
 
-- 되돌리기: 이전 publication 버전을 `latest`로 다시 지정하는 것도 같은 트랜잭션 + 감사 로그.
+**왜 이렇게 나눴나**
+
+| 단계 | 위치 | 이유 |
+|---|---|---|
+| 초안 상태 확인 (`ready`) | 트랜잭션 안 | 같은 초안을 두 관리자가 동시에 게시하면, 잠금 때문에 뒤 요청은 앞 요청이 `published`로 바꾼 뒤에 읽는다 → 409 |
+| 입력 버전 재확인 | 트랜잭션 안 | 확인과 게시 사이에 업로드·규칙 변경이 끼어들 수 없다 |
+| `v{N}.json` 쓰기 | 트랜잭션 안 | better-sqlite3와 `writeFileSync`/`renameSync`가 모두 동기라 잠금을 잡은 동안 끝난다. 파일 쓰기가 실패하면 예외 → DB도 롤백 |
+| `latest.json` 갱신 | 트랜잭션 밖 (커밋 후) | 항상 "DB 최대 버전"으로 다시 맞추므로 쓰기 순서가 엇갈려도 결국 최신으로 수렴 (옛 버전이 최신을 덮어쓰는 문제 방지) |
+| `markDraftStale` | 트랜잭션 밖 | 트랜잭션 안에서 표시하고 예외를 던지면 표시까지 롤백된다 |
+
+**장애 시나리오와 결과**
+
+| 언제 죽나 | DB | 파일 | 사용자에게 보이는 것 |
+|---|---|---|---|
+| 트랜잭션 중 예외·종료 | 롤백 (게시 없음) | `v{N}.json`이 남을 수 있음 | 이전 latest 그대로. 남은 파일은 DB에 없으니 무시되고, 다음 게시 때 같은 번호면 덮어써진다 |
+| 커밋 직후, latest 갱신 전 | 게시됨 | latest가 한 버전 뒤 | 서버 재시작 시 `syncLatestPointer()`가 복구 |
+| latest 쓰는 중 | 게시됨 | 임시 파일 + rename이라 반쯤 쓴 latest는 없음 | 이전 또는 새 latest 중 하나 |
+
+**되돌리기**: 과거 버전 K를 되돌릴 때는 latest를 직접 바꾸지 않고, **K의 내용을 새 버전(v+1)으로 다시 게시**한다 (`note: "vK 복원"`, 감사 로그). "latest = DB 최대 버전" 규칙이 깨지지 않는다.
 
 ### 6-5. SQLite 설정
 
 ```ts
-db.pragma("journal_mode = WAL");     // 읽기와 쓰기가 서로 덜 막힘
-db.pragma("busy_timeout = 5000");    // 잠금 대기 최대 5초 (즉시 SQLITE_BUSY 대신)
-db.pragma("foreign_keys = ON");
+db.pragma("journal_mode = WAL");     // 읽기와 쓰기가 서로 막지 않게
+db.pragma("busy_timeout = 5000");    // 잠금이 잡혀 있으면 최대 5초까지 재시도하며 대기
+db.pragma("foreign_keys = ON");      // 외래 키 제약 사용 (SQLite 기본값은 꺼짐)
 ```
-- 라이브러리: `better-sqlite3` (동기 API, 트랜잭션 헬퍼 `.immediate()`). 설치(네이티브 빌드)가 실패하면 Node 내장 `node:sqlite`로 대체 (Node 22.13+).
+
+**저널 모드: WAL을 쓰는 이유**
+
+| 계열 | 모드 | 방식 | 이 구조에서 |
+|---|---|---|---|
+| 롤백 저널 | `DELETE`(기본), `TRUNCATE`, `PERSIST` | 바꾸기 전 원본을 저널에 백업하고 DB 파일을 직접 고침 | 커밋 순간 배타 잠금 → 그동안 읽기가 막히고, 읽는 중인 연결이 있으면 커밋이 기다림 |
+| | `MEMORY`, `OFF` | 저널을 메모리에 두거나 쓰지 않음 | 중간에 죽으면 DB가 깨질 수 있어 쓰지 않음 |
+| 선행 기록 | **`WAL`** | 변경을 `-wal` 파일에 이어 쓰고, 체크포인트 때 DB 파일에 합침 | **읽는 쪽은 마지막 커밋 상태를 보고, 쓰는 쪽은 이어 쓴다 → 서로 막지 않음** |
+
+- 재계산 결과 저장·게시 중에도 관리자 화면 조회와 작업 상태 폴링이 막히지 않는다. 커밋 때 디스크 동기화 횟수도 줄어 쓰기가 대체로 빠르다.
+- **WAL도 쓰기는 한 번에 하나다.** 동시 게시를 막는 것은 WAL이 아니라 `BEGIN IMMEDIATE`(6-4)다.
+- 이 규모에서는 `DELETE` 모드로도 동작한다. 사용자 조회도 대부분 스냅샷을 읽는다. WAL은 "쓰기 중에도 관리자 쪽 읽기가 막히지 않게"라는 근거로 고른다.
+- 주의
+  - DB 옆에 `app.db-wal`, `app.db-shm`이 생긴다. **백업·제출 시 세 파일을 함께** 다룬다 (`app.db`만 복사하면 체크포인트 전 최근 커밋이 빠질 수 있다).
+  - 공유 메모리 파일을 쓰므로 같은 컴퓨터의 로컬 디스크에서만 쓴다 (네트워크 파일 시스템 금지).
+  - 오래 열린 읽기가 있으면 체크포인트가 밀려 `-wal` 파일이 커질 수 있다.
+  - `journal_mode = WAL`은 DB 파일에 저장되는 설정이라 한 번 바꾸면 유지된다.
+
+**`busy_timeout = 5000`: 5초인 이유**
+
+- SQLite 기본값은 0이다. 설정이 없으면 다른 연결이 잠금을 잡은 순간 기다리지 않고 바로 `SQLITE_BUSY` 에러가 난다.
+- 게시는 `BEGIN IMMEDIATE`로 잠금을 먼저 잡으므로, 동시에 온 두 번째 게시는 잠금을 기다려야 한다. 대기 시간이 있으면 **첫 게시가 끝나는 대로 두 번째가 이어서 처리**되고, 초안 상태 확인에서 409로 정상 거절된다.
+- 5초의 근거
+  - 쓰기 트랜잭션은 짧게 유지한다. 게시는 수 ms ~ 수백 ms이고, **무거운 계산은 트랜잭션 밖(작업 큐, 6-3)**에서 한다. 정상 대기에는 5초면 충분하다.
+  - 5초를 넘게 잠금이 안 풀리면 정상이 아니다 (트랜잭션 안에서 오래 걸리는 일을 하고 있다는 신호). 무한정 기다리지 않고 에러로 드러나게 한다.
+  - better-sqlite3는 연결 옵션 `timeout` 기본값이 이미 5000ms다. pragma는 의도를 명시하기 위해 적는다. **`node:sqlite`로 바꾸면 기본값이 0**이라 이 설정이 실제로 필요하다 (`new DatabaseSync(path, { timeout: 5000 })` 또는 pragma).
+- `busy_timeout`이 통하지 않는 경우: WAL에서 일반 `BEGIN`(지연 트랜잭션)으로 **먼저 읽고 나중에 쓰려는데** 그 사이 다른 연결이 커밋했다면, 기다리지 않고 바로 `SQLITE_BUSY`가 난다 (이미 오래된 데이터를 읽은 상태라 기다려도 소용이 없기 때문). → **쓰기가 있는 트랜잭션은 처음부터 `.immediate()`로 시작한다.**
+- **WAL + busy_timeout + BEGIN IMMEDIATE는 한 세트**다: 읽기는 막히지 않고, 쓰기는 하나씩 줄을 서고, 줄 선 쓰기는 즉시 실패하지 않는다.
+
+**요청 타임아웃과 맞추기**
+
+| 요청 | 클라이언트 타임아웃 | 이유 |
+|---|---|---|
+| 사용자 조회 | 5초 | 스냅샷을 읽어 DB 잠금을 기다릴 일이 거의 없음. 넘으면 캐시로 전환 (7-4) |
+| 관리자 쓰기 (저장·게시) | 10~15초 | DB 대기(최대 5초) + 처리 시간보다 넉넉하게. 짧으면 서버는 성공했는데 화면엔 실패로 보일 수 있음 |
+| 재계산 | 즉시 202 + 상태 폴링 | 긴 작업을 요청 하나로 기다리지 않음 |
+
+**그 밖의 설정**
+- 라이브러리: `better-sqlite3` (동기 API, 트랜잭션 헬퍼 `.immediate()`). 설치(네이티브 빌드)가 실패하면 Node 내장 `node:sqlite`로 대체 (Node 22.13+, `timeout` 옵션을 꼭 지정).
+- DB 연결은 모듈 하나(`server/db/client.ts`)에서 한 번만 만들고 재사용한다.
 - Route Handler에 `export const runtime = "nodejs";`, 데이터 API는 `export const dynamic = "force-dynamic";`.
 
 ### 6-6. 내가 직접 검증하는 법 (VERIFY.md)
@@ -312,8 +396,18 @@ curl -s -o /dev/null -w "%{http_code}\n" -b admin.txt -X PUT -H 'content-type: a
   -d "{\"version\":$V,\"json\":{\"capacity\":45}}" localhost:3000/api/admin/settings &
 wait
 # 재계산 버튼 동시 2회 → 202 하나, 409 하나
+# 같은 초안 동시 게시 2회 → 200 하나, 409(NOT_READY) 하나
 ```
-- 테스트를 테스트: `WHERE ... AND version = ?` 조건을 임시로 지우면 위 검증이 200, 200으로 바뀌어야 한다.
+
+| 검증 | 방법 | 기대값 |
+|---|---|---|
+| 낙관적 잠금 | 위 curl (같은 version 동시 PUT) | 200 하나, 409 하나 |
+| 중복 게시 | 같은 draftId로 게시 요청 2개 동시 | 200 하나, 409 하나, publications 1행 |
+| 동시 게시 순서 | 서로 다른 초안 2개 동시 게시 | 버전 v, v+1 / latest = v+1 |
+| 롤백 (원자성) | 테스트에서 `audit()`가 예외를 던지게 하고 게시 | publications 행 수 그대로, 초안 상태 `ready` 그대로 |
+| 오래된 초안 | 초안 생성 후 데이터 업로드 → 게시 | 409(STALE), 초안 상태 `stale` |
+| latest 복구 | latest.json을 옛 버전 파일로 바꾸고 서버 재시작 | latest = DB 최대 버전 |
+| 테스트를 테스트 | `WHERE ... AND version = ?` 제거 / `.immediate` 제거 + 초안 상태 확인 제거 | 각각 200·200이 나와야 함 (빈틈 재현) → 되돌리기 |
 
 ---
 
@@ -333,8 +427,9 @@ wait
 ### 7-2. 게시 스냅샷
 
 - 게시할 때 사용자 조회에 필요한 **최소 데이터만** 담은 JSON을 만든다.
-  `data/snapshots/v{N}.json` + `data/snapshots/latest.json` (또는 latest 포인터 파일)
-- 원자적 쓰기: 임시 파일에 쓰고 `rename` (같은 파일시스템에서 rename은 원자적) → 읽는 쪽이 반쯤 쓴 파일을 보지 않는다.
+  `data/snapshots/v{N}.json` (게시 트랜잭션 안에서, 한 번 쓰면 바꾸지 않음) + `data/snapshots/latest.json` (커밋 후 DB 최대 버전으로 맞춤, 6-4)
+- 원자적 쓰기: 같은 폴더의 임시 파일에 쓰고 `rename` (같은 파일 시스템에서 rename은 원자적) → 읽는 쪽이 반쯤 쓴 파일을 보지 않는다.
+  이것은 **파일 하나가 온전하다**는 보장이지, DB 커밋과 묶인다는 보장이 아니다. DB와의 일치는 `syncLatestPointer()`가 맞춘다.
 - **`public/`에 쓰지 않는다.** Next.js는 빌드 시점에 `public/`에 있던 파일만 제공하고, 실행 중에 추가된 파일은 제공하지 않는다. → `data/snapshots/`에 쓰고 Route Handler가 읽어서 응답.
 - 스냅샷 메타: `{ version, publishedAt, publishedBy, inputVersions }` → 화면의 "기준 시각".
 
@@ -348,6 +443,7 @@ GET /api/public/lookup?id=...&check=...
   3) toUserDto()로 최소 필드만
   4) 응답: { data, meta: { version, publishedAt } }
   - 스냅샷이 없으면(아직 게시 전) 404 + "아직 게시된 결과가 없습니다"
+  - latest를 읽지 못하면 syncLatestPointer()를 한 번 시도한 뒤 다시 읽는다"
 ```
 
 ### 7-4. 클라이언트 캐시 (Jotai `atomWithStorage`)
@@ -360,7 +456,7 @@ export const lastResultAtom = atomWithStorage<CachedResult | null>("lookup:last"
 ```
 
 ```
-조회 → fetchJson(url, { signal: AbortSignal.timeout(5000) })
+조회 → fetchJson(url, { signal: AbortSignal.timeout(5000) })   ← 사용자 조회 5초 (관리자 쓰기는 10~15초, 6-5)
   ├─ 성공: 화면 표시 + lastResultAtom 갱신
   └─ 실패(네트워크·타임아웃·5xx):
        캐시가 있고 같은 조회키 → 결과 표시 + 경고 배너 "○○ 기준 저장된 결과입니다. 서버에 연결할 수 없어 최신이 아닐 수 있습니다."
@@ -495,7 +591,9 @@ src/entities/<결과 도메인>/                    타입, 결과 카드, 표
 | 질문 | 답의 뼈대 (구조에서 가리킬 곳) |
 |---|---|
 | 업로드·계산·조회의 책임을 어떻게 나눴나? | `server/import` / `core` / `publish` / `read` 4분할, 라우트는 얇게, 조회는 게시본만 → 계산이 실패해도 조회 영향 없음, core 단독 테스트 |
-| 관리자 여러 명이 동시에 수정하면? | settings `version` 낙관적 잠금(409 + 충돌 안내), 재계산은 활성 작업 유니크 인덱스로 하나만, 게시는 `BEGIN IMMEDIATE` + 입력 버전 재확인, 감사 로그 |
+| 관리자 여러 명이 동시에 수정하면? | settings `version` 낙관적 잠금(409 + 충돌 안내), 재계산은 활성 작업 유니크 인덱스로 하나만, 게시는 `BEGIN IMMEDIATE` + 초안 상태·입력 버전 재확인, 감사 로그 |
+| 게시가 원자적이라고 어떻게 말할 수 있나? | transaction 래퍼가 BEGIN/COMMIT, 예외 시 ROLLBACK → 게시 행·초안 상태·감사 로그가 함께 반영 또는 취소. 파일은 트랜잭션 밖이라 DB를 진실의 원천으로 두고 latest를 DB 최대 버전에 맞춤. 롤백·중복 게시 검증 결과로 근거 제시 |
+| 왜 WAL이고 왜 5초인가? | 쓰기 중에도 읽기가 막히지 않게 WAL, 쓰기는 IMMEDIATE로 줄 세우고 busy_timeout으로 즉시 실패 방지. 5초는 짧은 게시 트랜잭션보다 충분히 길고, 넘으면 이상 상황으로 드러나게 한 값. 무거운 계산은 트랜잭션 밖 |
 | 사용자가 보는 중에 서버가 죽으면? | 게시 스냅샷(DB 장애와 분리) + 클라이언트 캐시(기준 시각 배너), 프로세스 전체 다운 새로고침은 한계 → 서비스 워커·외부 정적 호스팅이 대안 |
 | 관리자와 사용자를 어떻게 분리했나? | 라우트·API 네임스페이스·서버 모듈·응답 DTO 4곳, 미들웨어 + 핸들러 2단 권한 확인 |
 | 남의 정보가 보이지 않게 했나? | 본인 확인, `toUserDto()` 화이트리스트, 공용 PC 캐시 정책 |
